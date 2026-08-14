@@ -16,7 +16,7 @@ const BOLD: &str = "\u{1b}[1m";
 const DIM: &str = "\u{1b}[90m";
 const HEAD: &str = "\u{1b}[1;32m";
 const NAME: &str = "\u{1b}[36m";
-const LIVE: &str = "\u{1b}[96m";
+const LIVE: &str = "\u{1b}[97m";
 
 const GLIDER: [[bool; 3]; 3] = [
     [false, true, false],

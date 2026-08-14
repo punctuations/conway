@@ -92,6 +92,7 @@ const PROMPT_HINT: &str = "enter confirm · esc cancel ";
 const SKIP_CHECK: usize = 16;
 const SKIP_REDRAW: Duration = Duration::from_millis(50);
 const SKIP_POLL: Duration = Duration::from_millis(1);
+const IDLE_POLL: Duration = Duration::from_millis(250);
 
 fn action_for(code: KeyCode, modifiers: KeyModifiers) -> Action {
     match (code, modifiers) {
@@ -106,6 +107,7 @@ fn action_for(code: KeyCode, modifiers: KeyModifiers) -> Action {
 
 fn fast_forward(
     out: &mut impl Write,
+    painter: &mut Painter,
     grid: &mut Grid,
     bytes: &[u8],
     generation: &mut usize,
@@ -135,17 +137,16 @@ fn fast_forward(
         drawn = Instant::now();
 
         while event::poll(SKIP_POLL)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press
-                    && matches!(action_for(key.code, key.modifiers), Action::Quit)
-                {
-                    return Ok(None);
-                }
+            if let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+                && matches!(action_for(key.code, key.modifiers), Action::Quit)
+            {
+                return Ok(None);
             }
         }
 
         let status = format!("skipping to {target}");
-        draw(out, grid, *generation, &status, PROMPT_HINT)?;
+        painter.draw(out, grid, *generation, &status, PROMPT_HINT)?;
     }
 
     Ok(None)
@@ -183,8 +184,12 @@ fn drive(
     let mut paused = false;
     let mut finished: Option<Ending> = None;
     let mut prompt: Option<String> = None;
+    let mut painter = Painter::default();
+    let mut dirty = true;
 
     loop {
+        let idle = finished.is_some() || paused || prompt.is_some();
+
         let typed;
         let status = match (&prompt, &finished) {
             (Some(buffer), _) => {
@@ -196,9 +201,12 @@ fn drive(
             (None, None) => "running",
         };
         let hint = if prompt.is_some() { PROMPT_HINT } else { HINT };
-        draw(&mut out, grid, generation, status, hint)?;
+        if dirty {
+            painter.draw(&mut out, grid, generation, status, hint)?;
+            dirty = false;
+        }
 
-        let deadline = Instant::now() + delay;
+        let deadline = Instant::now() + if idle { IDLE_POLL } else { delay };
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -208,7 +216,9 @@ fn drive(
                 break;
             }
             match event::read()? {
+                Event::Resize(..) => dirty = true,
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    dirty = true;
                     if let Some(buffer) = prompt.as_mut() {
                         match key.code {
                             KeyCode::Char(digit) if digit.is_ascii_digit() => {
@@ -228,6 +238,7 @@ fn drive(
                                     let target = limit.map_or(target, |limit| target.min(limit));
                                     finished = fast_forward(
                                         &mut out,
+                                        &mut painter,
                                         grid,
                                         bytes,
                                         &mut generation,
@@ -260,7 +271,7 @@ fn drive(
             }
         }
 
-        if finished.is_some() || paused || prompt.is_some() {
+        if idle {
             continue;
         }
 
@@ -272,53 +283,74 @@ fn drive(
         grid.step();
         generation += 1;
         finished = watcher.verdict(grid);
+        dirty = true;
     }
 }
 
-fn draw(
-    out: &mut impl Write,
-    grid: &Grid,
-    generation: usize,
-    status: &str,
-    hint: &str,
-) -> io::Result<()> {
-    let (columns, rows) = terminal::size()?;
-    let columns = columns as usize;
-    let view_rows = rows.saturating_sub(1) as usize;
+#[derive(Default)]
+struct Painter {
+    painted: Vec<String>,
+    size: (usize, usize),
+}
 
-    queue!(out, SetForegroundColor(Color::Cyan))?;
+impl Painter {
+    fn draw(
+        &mut self,
+        out: &mut impl Write,
+        grid: &Grid,
+        generation: usize,
+        status: &str,
+        hint: &str,
+    ) -> io::Result<()> {
+        let (columns, rows) = terminal::size()?;
+        let columns = columns as usize;
+        let view_rows = rows.saturating_sub(1) as usize;
 
-    for y in 0..view_rows {
-        let mut line = String::with_capacity(columns);
-        if y < grid.height() {
-            for x in 0..columns.min(grid.width()) {
-                line.push(if grid.get(x, y) { game::LIVE_CELL } else { ' ' });
+        if self.size != (columns, view_rows) {
+            self.size = (columns, view_rows);
+            self.painted = vec![String::new(); view_rows];
+            queue!(out, terminal::Clear(terminal::ClearType::All))?;
+        }
+
+        queue!(out, SetForegroundColor(Color::White))?;
+
+        for y in 0..view_rows {
+            let mut line = String::with_capacity(columns);
+            if y < grid.height() {
+                for x in 0..columns.min(grid.width()) {
+                    line.push(if grid.get(x, y) { game::LIVE_CELL } else { ' ' });
+                }
             }
+            for _ in line.chars().count()..columns {
+                line.push(' ');
+            }
+
+            if self.painted[y] == line {
+                continue;
+            }
+            queue!(out, cursor::MoveTo(0, y as u16), Print(&line))?;
+            self.painted[y] = line;
         }
-        for _ in line.chars().count()..columns {
-            line.push(' ');
-        }
-        queue!(out, cursor::MoveTo(0, y as u16), Print(line))?;
+
+        let left = format!(" gen {generation}   pop {}   {status}", grid.population());
+        let mut bar = match columns.checked_sub(left.chars().count() + hint.chars().count() + 2) {
+            Some(gap) => format!("{left}{:gap$}  {hint}", ""),
+            None => left,
+        };
+        bar.truncate(
+            bar.char_indices()
+                .nth(columns)
+                .map_or(bar.len(), |(index, _)| index),
+        );
+
+        queue!(
+            out,
+            cursor::MoveTo(0, view_rows as u16),
+            SetForegroundColor(Color::DarkGrey),
+            Print(bar),
+            ResetColor
+        )?;
+
+        out.flush()
     }
-
-    let left = format!(" gen {generation}   pop {}   {status}", grid.population());
-    let mut bar = match columns.checked_sub(left.chars().count() + hint.chars().count() + 2) {
-        Some(gap) => format!("{left}{:gap$}  {hint}", ""),
-        None => left,
-    };
-    bar.truncate(
-        bar.char_indices()
-            .nth(columns)
-            .map_or(bar.len(), |(index, _)| index),
-    );
-
-    queue!(
-        out,
-        cursor::MoveTo(0, view_rows as u16),
-        SetForegroundColor(Color::DarkGrey),
-        Print(bar),
-        ResetColor
-    )?;
-
-    out.flush()
 }
